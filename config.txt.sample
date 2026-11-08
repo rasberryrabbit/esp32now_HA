@@ -1,0 +1,33 @@
+# ESP-NOW 메시 네트워크 Pro 설정 파일
+# 형식: 키=값 (값에 공백이 있으면 큰따옴표 사용)
+# 이 파일은 espnow_mesh_pro.py 가 자동으로 읽고 씁니다.
+#
+# 최초 부팅 시 이 파일이 없으면:
+#   - node_id   = MAC 주소 마지막 3바이트 hex (예: node-76c204)
+#   - nickname  = MAC 주소 마지막 2바이트 hex (예: ESP-c204)
+#   - node_role = "node" (기본값)
+#   위 값으로 자동 생성 후 이 파일이 만들어집니다.
+# 재부팅 시에는 이 파일의 값이 우선합니다.
+# 수동으로 편집해도 됩니다.
+
+# ---- 노드 식별 (자동 생성됨, 수동 변경 가능) ----
+node_id=node-76c204
+nickname=ESP-c204
+node_role=node
+
+# ---- 게이트웨이 Wi-Fi AP 정보 ----
+gateway_ssid=YOUR_WIFI_SSID
+gateway_password=YOUR_WIFI_PASSWORD
+
+# ---- MQTT 브로커 설정 ----
+mqtt_broker=broker.hivemq.com
+mqtt_port=1883
+
+# ---- MQTT 토픽 (선택) ----
+mqtt_topic_up=mesh/chat/up
+mqtt_topic_down=mesh/chat/down
+mqtt_topic_sensor=mesh/sensor
+
+# ---- 게이트웨이 다중화 그룹 ID ----
+# 다중 게이트웨이 구성 시 모든 게이트웨이가 같은 그룹 ID 사용
+gateway_group_id=mesh-gw-1
