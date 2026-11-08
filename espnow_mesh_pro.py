@@ -927,6 +927,57 @@ async def _handle_http_impl(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
             await writer.drain()
             return
+        elif path.startswith('/api/settime') and method == 'GET':
+            # /api/settime?time=2026-11-08T14:30:00
+            q = path.split('?', 1)[1] if '?' in path else ''
+            params = {}
+            for kv in q.split('&'):
+                if '=' in kv:
+                    k, v = kv.split('=', 1)
+                    params[k] = url_decode(v)
+            time_str = params.get('time', '')
+            if time_str:
+                try:
+                    # 형식: YYYY-MM-DDTHH:MM:SS 또는 YYYY-MM-DD HH:MM:SS
+                    time_str = time_str.replace('T', ' ')
+                    parts = time_str.replace('-', ' ').replace(':', ' ').split()
+                    if len(parts) >= 6:
+                        year = int(parts[0])
+                        month = int(parts[1])
+                        day = int(parts[2])
+                        hour = int(parts[3])
+                        minute = int(parts[4])
+                        second = int(parts[5])
+                        # RTC 설정 (마이크로파이썬 machine.RTC)
+                        try:
+                            import machine
+                            rtc = machine.RTC()
+                            rtc.datetime((year, month, day, 0, hour, minute, second, 0))
+                        except Exception:
+                            pass
+                        # NTP 동기화 상태 업데이트
+                        global _ntp_last_sync
+                        _ntp_last_sync = time.time()
+                        t = time.localtime()
+                        body = ujson.dumps({
+                            "status": "ok",
+                            "set_time": "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*t[:6]),
+                        }).encode()
+                        print("[TIME] 수동 설정: {:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*t[:6]))
+                    else:
+                        body = b'{"error":"invalid time format"}'
+                except Exception as ex:
+                    body = ujson.dumps({"status": "error", "error": str(ex)}).encode()
+            else:
+                # 현재 시간 반환
+                t = time.localtime()
+                body = ujson.dumps({
+                    "current_time": "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*t[:6]),
+                    "ntp_synced": _ntp_last_sync > 0,
+                }).encode()
+            writer.write(build_header("application/json", len(body)) + body)
+            await writer.drain()
+            return
         elif path.startswith('/api/config') and method == 'GET':
             # IP 주소 조회 (연결된 경우 또는 AP 모드)
             ip_addr = ""

@@ -577,6 +577,17 @@ input{flex:1}
     </div>
     <div id="config-result" style="margin-top:8px;color:#0f0;font-size:12px"></div>
   </div>
+  <div class="card">
+    <h2>Time Settings</h2>
+    <div style="color:#888;font-size:12px;margin-bottom:8px">NTP가 실패하면 수동으로 시간 설정</div>
+    <div id="current-time" style="color:#0ff;font-size:14px;margin-bottom:8px">Loading...</div>
+    <div class="send-form">
+      <input id="time-input" type="datetime-local" style="flex:1">
+      <button onclick="setTime()">Set</button>
+    </div>
+    <button onclick="syncBrowserTime()" style="margin-top:8px;background:#0f3460;color:white;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">Use Browser Time</button>
+    <div id="time-result" style="margin-top:8px;color:#0f0;font-size:12px"></div>
+  </div>
 </div>
 <div style="text-align:center;color:#444;font-size:11px;margin-top:15px">Mesh Dashboard v2.1</div>
 <script>
@@ -631,7 +642,49 @@ async function saveConfig(){
     loadConfig();
   }
 }
+async function loadTime(){
+  var r=await fetchJSON("/api/settime");
+  if(r){
+    document.getElementById("current-time").textContent=
+      "현재 시간: "+r.current_time+(r.ntp_synced?" (NTP)":" (수동)");
+    // datetime-local 입력 필드에 현재 시간 설정
+    if(r.current_time){
+      var dt=r.current_time.substring(0,16).replace(" ","T");
+      document.getElementById("time-input").value=dt;
+    }
+  }
+}
+async function setTime(){
+  var input=document.getElementById("time-input");
+  var timeVal=input.value;
+  if(!timeVal){document.getElementById("time-result").textContent="시간을 입력하세요";return}
+  var r=await fetchJSON("/api/settime?time="+encodeURIComponent(timeVal));
+  if(r&&r.status==="ok"){
+    document.getElementById("time-result").textContent="설정됨: "+r.set_time;
+    loadTime();
+  }else{
+    document.getElementById("time-result").textContent="설정 실패: "+JSON.stringify(r);
+  }
+}
+async function syncBrowserTime(){
+  var now=new Date();
+  var iso=now.getFullYear()+"-"+
+    ("0"+(now.getMonth()+1)).slice(-2)+"-"+
+    ("0"+now.getDate()).slice(-2)+"T"+
+    ("0"+now.getHours()).slice(-2)+":"+
+    ("0"+now.getMinutes()).slice(-2)+":"+
+    ("0"+now.getSeconds()).slice(-2);
+  var r=await fetchJSON("/api/settime?time="+encodeURIComponent(iso));
+  if(r&&r.status==="ok"){
+    document.getElementById("time-result").textContent="브라우저 시간으로 설정: "+r.set_time;
+    loadTime();
+  }else{
+    document.getElementById("time-result").textContent="설정 실패";
+  }
+}
 loadConfig();
+loadTime();
+setInterval(loadTime,10000);
 </script>
 </body>
 </html>"""
