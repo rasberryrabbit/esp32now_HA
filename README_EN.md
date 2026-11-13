@@ -77,12 +77,15 @@ Files that users modify per node. Auto-imported at boot and setup() is called.
 - BH1750 (light level, I2C)
 - BME280 (temp/humidity/pressure, I2C)
 - SHT30 (temp/humidity, I2C)
+- AHT10 (temp/humidity, I2C)
 - DS18B20 (1-Wire temperature)
 - MAX6675 (thermocouple, SPI)
 - MCP3008 (ADC, SPI)
 - SGP30 (CO2/TVOC, I2C)
 - MPU6050 (accelerometer/gyroscope, I2C) — raw accel/gyro, roll/pitch, accel magnitude, gyro-integrated yaw
 - ADS1115 (4-channel 16-bit I2C ADC)
+- CdS photoresistor (analog light, internal ADC) — raw/voltage/lux/percent/resistance
+- Hall sensor (analog field strength / digital detection+count+RPM)
 - ESP32 internal ADC
 - I2C GPIO expander inputs (MCP23017/PCF8574 as digital sensor)
 
@@ -281,6 +284,101 @@ sensor_runner.sm.reset_mpu_yaw()       # all registered MPU6050s
 ```
 
 **Note:** `gyaw` is a gyro-only relative angle, not an absolute heading. For absolute heading use a magnetometer-equipped chip (e.g. MPU9250). `roll`/`pitch` are gravity-referenced and accurate at rest or during slow motion.
+
+### AHT10 (temperature/humidity, I2C)
+
+AHT10 is a low-power I2C temp/humidity sensor. Default address `0x38` (AD0 high: `0x39`). Two channels share one 80 ms measurement, so registering both `temp` and `humidity` costs only one I2C blocking read per cycle.
+
+| channel | unit | description |
+|---------|------|-------------|
+| `temp` | C | temperature (-50 to +150 °C) |
+| `humidity` | % | relative humidity (0-100 %) |
+
+```python
+# custom/node_config.py
+SENSOR_CONFIG = {
+    "aht_temp": ("aht10", 0x38, "temp"),
+    "aht_humi": ("aht10", 0x38, "humidity"),
+}
+```
+
+Initialization sends the calibration command (`0xBE 0x08 0x00`) and waits for the calibrated bit; if calibration is incomplete it still proceeds. Measurement triggers `0xAC 0x33 0x00` and waits ~80 ms (plus a short busy-bit poll). The 20-bit raw values are converted with the standard `raw / 2^20` formula.
+
+### CdS Photoresistor (analog light sensor)
+
+A CdS cell (GL5528/GM5528 etc.) is read via a voltage divider on an ESP32 ADC pin. The `cds` type goes beyond raw ADC: with a per-sensor calibration it converts the midpoint voltage into CdS resistance, then into estimated lux and a relative brightness percent.
+
+**Wiring (recommended):** `Vcc --[CdS]--(ADC pin)--[R_fixed]-- GND` → `cds_top=True`. Reverse divider `Vcc --[R_fixed]--(ADC pin)--[CdS]-- GND` → `cds_top=False`.
+
+**Channels:**
+
+| channel | unit | needs calib | description |
+|---------|------|-------------|-------------|
+| `raw` | — | no | ADC raw 0-4095 |
+| `voltage` | V | no | divider midpoint voltage |
+| `resistance` | ohm | yes | CdS resistance (from divider math) |
+| `lux` | lx | yes | estimated lux via CdS log-log characteristic |
+| `percent` | % | yes | log-scaled brightness 0-100 (maps 0-10000 lx) |
+
+```python
+# custom/node_config.py
+SENSOR_CONFIG = {
+    "light": ("cds", 2, "lux"),       # estimated lux
+    # "light_raw": ("cds", 2, "raw"), # fallback if no calibration
+}
+
+# Calibration (lux/percent/resistance channels require this)
+CDS_CALIB = {
+    "light": {"r_fixed": 10000, "vcc": 3.3, "cds_top": True,
+              "r10": 20000, "gamma": 0.7},
+}
+```
+
+**Calibration fields:** `r_fixed` (divider resistor, ohm), `vcc` (supply V, ESP32=3.3), `cds_top` (CdS on Vcc side: True; on GND side: False), `r10` (CdS resistance at 10 lux — see the cell's datasheet, GL5528 ≈ 10-20 kΩ), `gamma` (log-log slope, 0.5-0.8, GL5528 ≈ 0.7). Lux is computed as `10 * (R10/R)^(1/gamma)` from the standard CdS R–lux log-log relation. Sensors without a `CDS_CALIB` entry can still use the `raw` and `voltage` channels.
+
+### Hall Sensor (magnetic field / detection)
+
+A Hall sensor measures magnetic fields. The `hall` type supports both **analog** (ratiometric voltage → field strength in Gauss) and **digital** (open-collector output → detection / pulse count / RPM) devices. The mode is set per sensor in `HALL_CALIB`; if omitted it is inferred from the channel (`state`/`count`/`rpm` → digital, otherwise analog).
+
+**Analog Hall** (A1301/A1302/49E/SS495 etc.): output sits at `v_quiescent` (~Vcc/2) at zero field and deviates proportionally with field polarity. Read via ADC.
+
+| channel | unit | needs calib | description |
+|---------|------|-------------|-------------|
+| `raw` | — | no | ADC raw 0-4095 |
+| `voltage` | V | no | sensor output voltage |
+| `field` | G | yes | signed field strength (Gauss) |
+| `polarity` | — | yes | 1 (N), -1 (S), 0 (none) |
+
+`field = (voltage - v_quiescent) × 1000 / sensitivity`, where `sensitivity` is in mV/G (datasheet; A1301=2.5, 49E≈1.6). `polarity` uses a `threshold` in Gauss (default 5).
+
+**Digital Hall** (A3144/44E/3144 latching or switch): open-collector output toggles when a magnet is near. Read via GPIO with an interrupt-based edge counter.
+
+| channel | unit | needs calib | description |
+|---------|------|-------------|-------------|
+| `state` | — | no | current pin level (0/1) |
+| `count` | — | no* | cumulative pulse count since boot (interrupt) |
+| `rpm` | rpm | no* | rotations/min since last read |
+
+\* `count`/`rpm` work with defaults (`pull=up`, `detect=falling`, `ppr=1`); set `HALL_CALIB` to change edge/pull/pulses-per-rev. RPM is computed as `(Δcount / ppr) × 60000 / Δt_ms` between reads, so it reflects the average speed over the read interval (not instantaneous).
+
+```python
+# custom/node_config.py
+SENSOR_CONFIG = {
+    # analog: field strength
+    "field":   ("hall", 4, "field"),
+    # digital: detection + rotation counting
+    "detect":  ("hall", 5, "state"),
+    "rpm":     ("hall", 5, "rpm"),
+}
+
+HALL_CALIB = {
+    "field": {"mode": "analog",  "vcc": 3.3, "v_quiescent": 1.65,
+              "sensitivity": 2.5, "threshold": 5.0},
+    "rpm":   {"mode": "digital", "pull": "up", "detect": "falling", "ppr": 1},
+}
+```
+
+**Wiring:** analog Hall → ADC pin (share Vcc/GND). Digital Hall → GPIO pin with pull-up (internal or external 10 kΩ); the open-collector pulls the line low when a magnet is detected. For RPM/rotation, mount one magnet on the rotating part and fix the sensor nearby; one pass = one pulse (`ppr=1`). Multiple magnets or multi-pole rings raise `ppr` accordingly.
 
 ## Automation Rules
 

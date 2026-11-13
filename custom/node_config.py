@@ -24,6 +24,16 @@ SENSOR_CONFIG = {
     # "외부습도": ("bme280", 0x76, "humidity"),
     # "기압": ("bme280", 0x76, "pressure"),
 
+    # AHT10 (온도/습도, I2C 기본주소 0x38 / 0x39)
+    # channel: "temp"(C), "humidity"(%)
+    # 두 채널은 한 번의 측정(80ms) 결과를 공유
+    # "AHT온도": ("aht10", 0x38, "temp"),
+    # "AHT습도": ("aht10", 0x38, "humidity"),
+
+    # SHT30 (온도/습도, I2C 기본주소 0x44 / 0x45)
+    # "SHT온도": ("sht30", 0x44, "temp"),
+    # "SHT습도": ("sht30", 0x44, "humidity"),
+
     # DS18B20 (1-Wire 온도, 인덱스로 구분)
     # "수온1": ("ds18b20", 12, 0),
     # "수온2": ("ds18b20", 12, 1),
@@ -56,6 +66,25 @@ SENSOR_CONFIG = {
 
     # ESP32 내장 ADC
     "배터리": ("adc", 1, "voltage"),
+
+    # CdS 광전소자 (포토레지스터, 전압분배 + 내장 ADC)
+    # channel: "raw"(0-4095), "voltage"(V), "lux"(lx), "percent"(0-100%), "resistance"(ohm)
+    # lux/percent/resistance 는 아래 CDS_CALIB 캘리브레이션 필요 (없으면 raw/voltage만)
+    # 회로: Vcc --[CdS]--(ADC핀)--[R_fixed]-- GND  (cds_top=True, 권장)
+    #   또는 Vcc --[R_fixed]--(ADC핀)--[CdS]-- GND  (cds_top=False)
+    # "조도": ("cds", 2, "lux"),
+    # "조도RAW": ("cds", 2, "raw"),
+    # "조도전압": ("cds", 2, "voltage"),
+
+    # 홀 센서 (자기장/자기 감지)
+    # 아날로그(A1301/49E 등): channel "raw"/"voltage"/"field"(G)/"polarity"(1/0/-1)
+    #   → HALL_CALIB 의 mode="analog", sensitivity(mV/G) 필요 (field/polarity만)
+    # 디지털(A3144/44E 등): channel "state"(0/1)/"count"(누적)/"rpm"
+    #   → HALL_CALIB 의 mode="digital", pull/detect/ppr (없으면 기본값으로 동작)
+    # "자기장": ("hall", 4, "field"),
+    # "자기감지": ("hall", 5, "state"),
+    # "회전수": ("hall", 5, "count"),
+    # "RPM": ("hall", 5, "rpm"),
 
     # ADS1115 I2C ADC 모듈 (4채널 16비트, 0x48-0x4B)
     # 형식: (type, i2c_addr, channel, unit)
@@ -93,6 +122,39 @@ NEOPIXEL_CONFIG = {
 }
 # NeoPixel LED 개수 (LED 체인 길이)
 NEOPIXEL_COUNT = 1    # 온보드 LED 1개
+
+# CdS 광전소자 캘리브레이션 (lux/percent/resistance 변환용)
+# {센서이름: {"r_fixed": ohm, "vcc": V, "cds_top": bool, "r10": ohm, "gamma": float}}
+#   r_fixed  : 전압분래 고정저항 (ohm, 일반적으로 10k)
+#   vcc      : 공급전압 (V, ESP32는 3.3)
+#   cds_top  : True=Cds가 Vcc측, 고정저항이 GND측 (권장)
+#              False=고정저항이 Vcc측, CdS가 GND측
+#   r10      : CdS 저항 @ 10 lux (GL5528/GM5528 ≈ 10-20k, 데이터시트 참고)
+#   gamma    : log-log 기울기 (0.5-0.8, GL5528 ≈ 0.7)
+# 캘리브 없는 CdS 센서는 raw/voltage 채널만 사용 가능
+CDS_CALIB = {
+    # "조도": {"r_fixed": 10000, "vcc": 3.3, "cds_top": True, "r10": 20000, "gamma": 0.7},
+}
+
+# 홀 센서 캘리브레이션 (자기장 변환 / 디지털 감지설정)
+# {센서이름: {필드...}}  - mode 생략 시 channel로 자동 추론
+#   [공통]
+#     mode       : "analog" 또는 "digital" (생략 시 channel로 추론)
+#   [analog - 아날로그 홀, 자기장 세기]
+#     vcc         : 공급전압 (V, ESP32는 3.3)
+#     v_quiescent : 무자계 시 출력전압 (V, 보통 vcc/2)
+#     sensitivity : 감도 (mV/Gauss, 데이터시트 - A1301=2.5, 49E≈1.6)
+#     threshold   : 극성 판정 임계 (Gauss, 기본 5)
+#     → field(G) = (전압 - v_quiescent) × 1000 / sensitivity
+#   [digital - 디지털 홀, 감지/카운트/RPM]
+#     pull   : "up"/"down"/"none" (내부 풀업, 기본 "up")
+#     detect : "rising"/"falling"/"both" (카운트 엣지, 기본 "falling")
+#     ppr    : 1회전당 펄스수 (RPM 계산용, 기본 1)
+#     → rpm = (펄스증가 / ppr) × 60000 / dt_ms
+HALL_CALIB = {
+    # "자기장": {"mode": "analog", "vcc": 3.3, "v_quiescent": 1.65, "sensitivity": 2.5},
+    # "RPM": {"mode": "digital", "pull": "up", "detect": "falling", "ppr": 1},
+}
 
 # MCP23017 (I2C 16채널 GPIO 확장) 설정
 # {이름: (i2c_addr, pin)} - pin: 0-15 (포트 A: 0-7, 포트 B: 8-15)
@@ -134,3 +196,5 @@ def setup():
     print("[CONFIG]   NeoPixel: {} 개".format(len(NEOPIXEL_CONFIG)))
     print("[CONFIG]   MCP23017: {} 개".format(len(MCP23017_CONFIG)))
     print("[CONFIG]   PCF8574: {} 개".format(len(PCF8574_CONFIG)))
+    print("[CONFIG]   CdS 캘리브: {} 개".format(len(CDS_CALIB)))
+    print("[CONFIG]   Hall 캘리브: {} 개".format(len(HALL_CALIB)))

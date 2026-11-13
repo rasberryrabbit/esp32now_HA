@@ -71,7 +71,7 @@
 
 ### 센서/GPIO 제어
 
-- 센서 자동 감지 (DHT22, BH1750, BME280, SHT30, DS18B20, SGP30, MPU6050, ADS1115, MCP3008, MAX6675, ADC, I2C 확장 입력)
+- 센서 자동 감지 (DHT22, BH1750, BME280, SHT30, AHT10, DS18B20, SGP30, MPU6050, ADS1115, MCP3008, MAX6675, CdS 광전소자, Hall 센서, ADC, I2C 확장 입력)
 - GPIO 이름 기반 원격 제어: `/GPIO <이름> <값>`
 - PWM 듀티 제어 (0-1023 또는 0-100%)
 - 장치 정보 브로드캐스트 (device_info 메시지)
@@ -218,6 +218,101 @@ sensor_runner.sm.reset_mpu_yaw()            # 등록된 모든 MPU6050
 ```
 
 **주의:** `gyaw`는 자이로만 적분한 상대각이므로 절대 방위가 아닙니다. 절대 방위가 필요하면 MPU9250(자력계 포함) 등을 사용해야 합니다. `roll`/`pitch`는 중력 방향을 기준으로 하므로 정지 또는 완만한 동작에서 정확합니다.
+
+### AHT10 (온도/습도, I2C) 설정
+
+AHT10은 저전력 I2C 온도/습도 센서입니다. 기본 주소 `0x38`(AD0 High 시 `0x39`). `temp`와 `humidity` 두 채널은 한 번의 80ms 측정 결과를 공유하므로 두 채널을 등록해도 I2C 차단은 주기당 1회입니다.
+
+| channel | 단위 | 설명 |
+|---------|------|------|
+| `temp` | C | 온도 (-50 ~ +150 °C) |
+| `humidity` | % | 상대습도 (0-100 %) |
+
+```python
+# custom/node_config.py
+SENSOR_CONFIG = {
+    "AHT온도": ("aht10", 0x38, "temp"),
+    "AHT습도": ("aht10", 0x38, "humidity"),
+}
+```
+
+초기화 시 캘리브레이션 명령(`0xBE 0x08 0x00`)을 보내고 캘리브 완료 비트를 기다립니다(미완료 시에도 진행). 측정은 `0xAC 0x33 0x00` 트리거 후 ~80ms 대기(busy 비트 추가 폴링)하며, 20비트 raw 값을 표준 `raw / 2^20` 공식으로 변환합니다.
+
+### CdS 광전소자 (포토레지스터) 설정
+
+CdS 셀(GL5528/GM5528 등)은 ESP32 ADC 핀에 전압분배 회로로 연결합니다. `cds` 타입은 단순 ADC를 넘어, 센서별 캘리브레이션을 주면 중간 전압을 CdS 저항으로 역산하고, 다시 추정 lux와 상대 밝기(%)로 변환합니다.
+
+**권장 회로:** `Vcc --[CdS]--(ADC 핀)--[R_fixed]-- GND` → `cds_top=True`. 반대 배치 `Vcc --[R_fixed]--(ADC 핀)--[CdS]-- GND` → `cds_top=False`.
+
+**채널:**
+
+| channel | 단위 | 캘리브 필요 | 설명 |
+|---------|------|------------|------|
+| `raw` | — | 아니오 | ADC raw 0-4095 |
+| `voltage` | V | 아니오 | 분배 중간 전압 |
+| `resistance` | ohm | 예 | CdS 저항 (분배 수식 역산) |
+| `lux` | lx | 예 | CdS log-log 특성으로 추정한 lux |
+| `percent` | % | 예 | 로그 스케일 밝기 0-100 (0-10000 lx 매핑) |
+
+```python
+# custom/node_config.py
+SENSOR_CONFIG = {
+    "조도": ("cds", 2, "lux"),         # 추정 lux
+    # "조도RAW": ("cds", 2, "raw"),   # 캘리브 없을 때 폴백
+}
+
+# 캘리브레이션 (lux/percent/resistance 채널은 필수)
+CDS_CALIB = {
+    "조도": {"r_fixed": 10000, "vcc": 3.3, "cds_top": True,
+             "r10": 20000, "gamma": 0.7},
+}
+```
+
+**캘리브 필드:** `r_fixed`(분래 고정저항, ohm), `vcc`(공급전압, ESP32=3.3), `cds_top`(CdS가 Vcc측이면 True, GND측이면 False), `r10`(10 lux에서의 CdS 저항 — 셀 데이터시트 참고, GL5528 ≈ 10-20kΩ), `gamma`(log-log 기울기, 0.5-0.8, GL5528 ≈ 0.7). lux는 CdS R-lux log-log 관계식 `10 × (R10/R)^(1/gamma)`로 계산합니다. `CDS_CALIB`에 등록되지 않은 CdS 센서는 `raw`/`voltage` 채널만 사용할 수 있습니다.
+
+### 홀 센서 (자기장 / 자기 감지) 설정
+
+홀 센서는 자기장을 측정합니다. `hall` 타입은 **아날로그**(비례 전압 → 자기장 세기 Gauss)와 **디지털**(오픈컬렉터 출력 → 감지/펄스 카운트/RPM)을 모두 지원합니다. 모드는 `HALL_CALIB[name]["mode"]`로 지정하며, 생략 시 channel로 자동 추론합니다(`state`/`count`/`rpm` → 디지털, 나머지 → 아날로그).
+
+**아날로그 홀**(A1301/A1302/49E/SS495 등): 무자계 시 `v_quiescent`(~Vcc/2)에서 극성에 비례해 전압이 변동. ADC로 읽습니다.
+
+| channel | 단위 | 캘리브 | 설명 |
+|---------|------|-------|------|
+| `raw` | — | 아니오 | ADC raw 0-4095 |
+| `voltage` | V | 아니오 | 센서 출력 전압 |
+| `field` | G | 예 | 부호 있는 자기장 세기 (Gauss) |
+| `polarity` | — | 예 | 1(N), -1(S), 0(무) |
+
+`field = (전압 - v_quiescent) × 1000 / sensitivity`, `sensitivity`는 mV/G(데이터시트 - A1301=2.5, 49E≈1.6). `polarity`는 `threshold`(Gauss, 기본 5)로 판정합니다.
+
+**디지털 홀**(A3144/44E/3144 래칭/스위치): 자석이 가까우면 오픈컬렉터 출력이 토글. GPIO + 인터럽트 엣지 카운터로 동작합니다.
+
+| channel | 단위 | 캘리브 | 설명 |
+|---------|------|-------|------|
+| `state` | — | 아니오 | 현재 핀 레벨 (0/1) |
+| `count` | — | 아니오* | 부팅 후 누적 펄스 수 (인터럽트) |
+| `rpm` | rpm | 아니오* | 직전 읽기 이후 분당 회전수 |
+
+\* `count`/`rpm`은 기본값(`pull=up`, `detect=falling`, `ppr=1`)으로 동작합니다. 엣지/풀/1회전당 펄스를 바꾸려면 `HALL_CALIB` 설정. RPM은 읽기 간격 동안의 평균 속도로 `(Δcount / ppr) × 60000 / Δt_ms`로 계산합니다(순간값 아님).
+
+```python
+# custom/node_config.py
+SENSOR_CONFIG = {
+    # 아날로그: 자기장 세기
+    "자기장":  ("hall", 4, "field"),
+    # 디지털: 감지 + 회전 카운트
+    "자기감지": ("hall", 5, "state"),
+    "RPM":     ("hall", 5, "rpm"),
+}
+
+HALL_CALIB = {
+    "자기장": {"mode": "analog",  "vcc": 3.3, "v_quiescent": 1.65,
+               "sensitivity": 2.5, "threshold": 5.0},
+    "RPM":   {"mode": "digital", "pull": "up", "detect": "falling", "ppr": 1},
+}
+```
+
+**배선:** 아날로그 홀 → ADC 핀(Vcc/GND 공통). 디지털 홀 → GPIO 핀에 풀업(내부 또는 외부 10kΩ), 자석 감지 시 오픈컬렉터가 라인을 LOW로 당깁니다. RPM/회전 측정은 회전체에 자석 1개를 부착하고 센서를 근처에 고정(1회전 = 1펄스, `ppr=1`). 다극 링 자석이나 자석 여러 개면 `ppr`을 그에 맞게 설정하세요.
 
 ## 자동화 규칙 예제
 

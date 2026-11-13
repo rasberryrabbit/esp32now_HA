@@ -177,6 +177,9 @@ class SensorManager:
         self.onewire_roms = {}
         self._neopixel_counts = {}
         self._mpu_yaw_state = {}   # {i2c_addr: {"yaw": float, "ts": ms}} - 자이로 yaw 적분
+        self._cds_calib = {}       # {센서이름: {r_fixed, vcc, cds_top, r10, gamma}} - CdS 캘리브레이션
+        self._hall_calib = {}      # {센서이름: {mode, pull, detect, ppr, v_quiescent, sensitivity}} - Hall 캘리브레이션
+        self._hall_count = {}      # {센서이름: {"count": int, "last_ts": ms, "last_count": int}} - 디지털 Hall 카운터
         self.node_id = "unknown"
         self.nickname = "unknown"
 
@@ -271,7 +274,7 @@ class SensorManager:
                         print("  - {}: i2c_input 초기화 오류: {}".format(name, ex))
                     continue
 
-                obj = self._get_or_create(stype, pin_or_addr)
+                obj = self._get_or_create(stype, pin_or_addr, name, channel)
                 if obj is None:
                     print("  - {}: 초기화 실패 ({})".format(name, stype))
                     continue
@@ -289,6 +292,12 @@ class SensorManager:
             ("bh1750", "lux"): "lx",
             ("bme280", "temp"): "C", ("bme280", "humidity"): "%", ("bme280", "pressure"): "hPa",
             ("sht30", "temp"): "C", ("sht30", "humidity"): "%",
+            ("aht10", "temp"): "C", ("aht10", "humidity"): "%",
+            ("cds", "raw"): "", ("cds", "voltage"): "V",
+            ("cds", "lux"): "lx", ("cds", "percent"): "%", ("cds", "resistance"): "ohm",
+            ("hall", "raw"): "", ("hall", "voltage"): "V",
+            ("hall", "field"): "G", ("hall", "polarity"): "",
+            ("hall", "state"): "", ("hall", "count"): "", ("hall", "rpm"): "rpm",
             ("max6675", "temp"): "C",
             ("adc", "raw"): "", ("adc", "voltage"): "V",
             ("sgp30", "co2"): "ppm", ("sgp30", "tvoc"): "ppb",
@@ -306,7 +315,7 @@ class SensorManager:
             return ""
         return defaults.get((stype, channel), "")
 
-    def _get_or_create(self, stype, pin_or_addr):
+    def _get_or_create(self, stype, pin_or_addr, name=None, channel=None):
         key = (stype, pin_or_addr)
         if key in self._objects:
             return self._objects[key]
@@ -348,6 +357,32 @@ class SensorManager:
                         return None
                 self._objects[key] = self.i2c_bus
                 print("[SENSOR] SHT30 초기화 (0x{:02x})".format(pin_or_addr))
+                return self.i2c_bus
+            elif stype == "aht10":
+                # AHT10 온도/습도 (I2C, 기본주소 0x38 / 0x39)
+                if self.i2c_bus is None:
+                    if not self.init_i2c():
+                        return None
+                try:
+                    # 캘리브레이션 명령: 0xBE 0x08 0x00
+                    self.i2c_bus.writeto(pin_or_addr, bytes([0xBE, 0x08, 0x00]))
+                    time.sleep_ms(10)
+                    # 상태 읽기 (bit3=1 이면 캘리브 완료), 완료까지 최대 40ms 대기
+                    ok = False
+                    for _ in range(8):
+                        self.i2c_bus.writeto(pin_or_addr, bytes([0x71]))
+                        st = self.i2c_bus.readfrom(pin_or_addr, 1)[0]
+                        if st & 0x08:
+                            ok = True
+                            break
+                        time.sleep_ms(5)
+                    if not ok:
+                        print("[SENSOR] AHT10 캘리브레이션 미완료 (계속 진행)")
+                except Exception as ex:
+                    print("[SENSOR] AHT10 초기화 오류:", ex)
+                    return None
+                self._objects[key] = self.i2c_bus
+                print("[SENSOR] AHT10 초기화 (0x{:02x})".format(pin_or_addr))
                 return self.i2c_bus
             elif stype == "ds18b20":
                 if not _HAS_ONEWIRE:
@@ -426,6 +461,68 @@ class SensorManager:
                 self._objects[key] = obj
                 print("[SENSOR] ADC 초기화 (GPIO {})".format(pin_or_addr))
                 return obj
+            elif stype == "cds":
+                # CdS 광전소자 (포토레지스터): 전압분배 회로 + ESP32 내장 ADC
+                # pin_or_addr = ADC 핀 번호
+                # lux/percent/resistance 변환은 sm._cds_calib[name] 캘리브레이션 사용
+                #   (node_config.CDS_CALIB 에서 sensors.py 가 로드, read()에서 적용)
+                obj = ADC(Pin(pin_or_addr))
+                obj.atten(ADC.ATTN_11DB)
+                obj.width(ADC.WIDTH_12BIT)
+                self._objects[key] = obj
+                print("[SENSOR] CdS 초기화 (GPIO {})".format(pin_or_addr))
+                return obj
+            elif stype == "hall":
+                # 홀 센서: 아날로그(자기장 세기) 또는 디지털(감지/카운트/RPM)
+                # pin_or_addr = ADC 핀(아날로그) 또는 GPIO 핀(디지털)
+                # 모드 결정: HALL_CALIB[name]["mode"] 우선, 없으면 channel로 추론
+                #   digital 채널: state/count/rpm → GPIO + 인터럽트
+                #   analog 채널: raw/voltage/field/polarity → ADC
+                calib = self._hall_calib.get(name, {})
+                mode = calib.get("mode")
+                if mode is None:
+                    if channel in ("state", "count", "rpm"):
+                        mode = "digital"
+                    else:
+                        mode = "analog"
+                if mode == "digital":
+                    pull_cfg = calib.get("pull", "up")
+                    if pull_cfg == "up":
+                        pull = Pin.PULL_UP
+                    elif pull_cfg == "down":
+                        pull = Pin.PULL_DOWN
+                    else:
+                        pull = None
+                    obj = Pin(pin_or_addr, Pin.IN, pull) if pull else Pin(pin_or_addr, Pin.IN)
+                    detect = calib.get("detect", "falling")
+                    if detect == "rising":
+                        trigger = Pin.IRQ_RISING
+                    elif detect == "both":
+                        trigger = Pin.IRQ_RISING | Pin.IRQ_FALLING
+                    else:
+                        trigger = Pin.IRQ_FALLING
+                    # 카운터 상태 + 인터럽트 핸들러
+                    cnt_state = {"count": 0, "last_ts": time.ticks_ms(), "last_count": 0}
+                    self._hall_count[name] = cnt_state
+                    def _make_hall_irq(ref):
+                        def _irq(p):
+                            ref["count"] += 1
+                        return _irq
+                    try:
+                        obj.irq(trigger=trigger, handler=_make_hall_irq(cnt_state))
+                    except Exception as ex:
+                        print("[SENSOR] Hall 인터럽트 설정 실패:", ex)
+                    self._objects[key] = obj
+                    print("[SENSOR] Hall 디지털 초기화 (GPIO {}, detect={}, pull={})".format(
+                        pin_or_addr, detect, pull_cfg))
+                    return obj
+                else:
+                    obj = ADC(Pin(pin_or_addr))
+                    obj.atten(ADC.ATTN_11DB)
+                    obj.width(ADC.WIDTH_12BIT)
+                    self._objects[key] = obj
+                    print("[SENSOR] Hall 아날로그 초기화 (GPIO {})".format(pin_or_addr))
+                    return obj
             elif stype == "ads1115":
                 # ADS1115 I2C ADC 모듈
                 # spec: (type, i2c_addr, channel, unit) 또는 (type, i2c_addr, channel)
@@ -490,6 +587,33 @@ class SensorManager:
                     return round(temp, 1)
                 elif channel == "humidity":
                     return round(humi, 1)
+            elif stype == "aht10":
+                # 측정 결과 캐시: temp/humidity 두 채널이 한 번의 측정 공유 (80ms 차단 1회)
+                cache_key = ("aht10_data", pin_or_addr)
+                now_ms = time.ticks_ms()
+                cache = self._objects.get(cache_key)
+                if cache is not None and abs(time.ticks_diff(now_ms, cache["ts"])) < 500:
+                    m = cache["m"]
+                else:
+                    # 측정 트리거: 0xAC 0x33 0x00
+                    sensor.writeto(pin_or_addr, bytes([0xAC, 0x33, 0x00]))
+                    time.sleep_ms(80)
+                    data = sensor.readfrom(pin_or_addr, 6)
+                    # busy 비트(bit7) 클리어까지 최대 20ms 추가 대기
+                    for _ in range(4):
+                        if not (data[0] & 0x80):
+                            break
+                        time.sleep_ms(5)
+                        data = sensor.readfrom(pin_or_addr, 6)
+                    # 습도 20비트, 온도 20비트 (2^20 = 1048576)
+                    h_raw = (data[1] << 12) | (data[2] << 4) | (data[3] >> 4)
+                    t_raw = ((data[3] & 0x0F) << 16) | (data[4] << 8) | data[5]
+                    humi = h_raw / 1048576.0 * 100
+                    temp = t_raw / 1048576.0 * 200 - 50
+                    m = {"temp": temp, "humidity": humi}
+                    self._objects[cache_key] = {"ts": now_ms, "m": m}
+                if channel in m:
+                    return round(m[channel], 1)
             elif stype == "ds18b20":
                 roms = self.onewire_roms.get(pin_or_addr, [])
                 if not roms or channel >= len(roms):
@@ -521,6 +645,118 @@ class SensorManager:
                     return raw
                 elif channel == "voltage":
                     return round(raw * 3.3 / 4095, 3)
+            elif stype == "cds":
+                # CdS 광전소자: ADC raw → 전압 → (캘리브 시) 저항/lux/percent
+                raw = sensor.read()
+                if channel == "raw":
+                    return raw
+                calib = self._cds_calib.get(name, {})
+                vcc = calib.get("vcc", 3.3)
+                voltage = raw * vcc / 4095
+                if channel == "voltage":
+                    return round(voltage, 3)
+                # lux/percent/resistance 는 캘리브레이션 필요
+                if not calib:
+                    return None
+                r_fixed = calib.get("r_fixed", 10000)
+                cds_top = calib.get("cds_top", True)
+                r10 = calib.get("r10", 10000)
+                gamma = calib.get("gamma", 0.7)
+                # 전압 클램핑 (분모 0 방지, 극단값 보정)
+                v_clamped = voltage
+                if v_clamped < 0.05:
+                    v_clamped = 0.05
+                elif v_clamped > vcc - 0.05:
+                    v_clamped = vcc - 0.05
+                # 전압분배에서 CdS 저항 역산
+                #   cds_top=True (CdS-Vcc, R_fixed-GND): V_out = Vcc*R_fixed/(R_cds+R_fixed)
+                #   cds_top=False (R_fixed-Vcc, CdS-GND): V_out = Vcc*R_cds/(R_cds+R_fixed)
+                if cds_top:
+                    r_cds = r_fixed * (vcc - v_clamped) / v_clamped
+                else:
+                    r_cds = r_fixed * v_clamped / (vcc - v_clamped)
+                if r_cds <= 0:
+                    r_cds = 1.0
+                if channel == "resistance":
+                    return round(r_cds, 1)
+                # lux = 10 * (R10/R)^(1/gamma)  (CdS log-log 특성)
+                lux = 0.0
+                if _HAS_MATH and r_cds > 0:
+                    try:
+                        lux = 10.0 * ((r10 / r_cds) ** (1.0 / gamma))
+                    except Exception:
+                        lux = 0.0
+                if channel == "lux":
+                    return round(lux, 1)
+                if channel == "percent":
+                    # 로그 스케일 매핑: 0-10000 lux → 0-100%
+                    p = 0.0
+                    if _HAS_MATH:
+                        p = 100.0 * math.log10(lux + 1) / math.log10(10000 + 1)
+                        if p < 0:
+                            p = 0.0
+                        elif p > 100:
+                            p = 100.0
+                    return round(p, 1)
+            elif stype == "hall":
+                calib = self._hall_calib.get(name, {})
+                mode = calib.get("mode")
+                if mode is None:
+                    if channel in ("state", "count", "rpm"):
+                        mode = "digital"
+                    else:
+                        mode = "analog"
+                if mode == "digital":
+                    # 디지털 홀: 상태/누적 카운트/RPM
+                    if channel == "state":
+                        return sensor.value()
+                    cnt_state = self._hall_count.get(name)
+                    if cnt_state is None:
+                        return None
+                    if channel == "count":
+                        return cnt_state["count"]
+                    if channel == "rpm":
+                        now_ms = time.ticks_ms()
+                        dt_ms = time.ticks_diff(now_ms, cnt_state["last_ts"])
+                        cur = cnt_state["count"]
+                        d_count = cur - cnt_state["last_count"]
+                        cnt_state["last_ts"] = now_ms
+                        cnt_state["last_count"] = cur
+                        ppr = calib.get("ppr", 1)
+                        if dt_ms <= 0 or ppr <= 0:
+                            return 0
+                        # RPM = (펄스증가 / ppr) / (dt_s / 60)
+                        rpm = d_count / ppr * 60000.0 / dt_ms
+                        if rpm < 0:
+                            rpm = 0.0
+                        return round(rpm, 1)
+                    return None
+                else:
+                    # 아날로그 홀: ADC raw/전압/자기장(Gauss)/극성
+                    raw = sensor.read()
+                    if channel == "raw":
+                        return raw
+                    vcc = calib.get("vcc", 3.3)
+                    voltage = raw * vcc / 4095
+                    if channel == "voltage":
+                        return round(voltage, 3)
+                    # field/polarity 는 캘리브레이션 필요
+                    if not calib:
+                        return None
+                    v_quiescent = calib.get("v_quiescent", vcc / 2)
+                    sensitivity = calib.get("sensitivity", 2.5)   # mV/Gauss
+                    # field(G) = (전압차 mV) / 감도(mV/G)
+                    field = (voltage - v_quiescent) * 1000.0 / sensitivity
+                    if channel == "field":
+                        return round(field, 1)
+                    if channel == "polarity":
+                        thresh = calib.get("threshold", 5.0)   # Gauss 임계
+                        if field > thresh:
+                            return 1
+                        elif field < -thresh:
+                            return -1
+                        return 0
+                    return None
             elif stype == "ads1115":
                 # channel: 정수 0-3 (ADS1115 ADC 채널)
                 # unit: "voltage" (기본, V) 또는 "raw" (0-32767)

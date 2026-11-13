@@ -39,6 +39,24 @@ def setup():
     except Exception as ex:
         print("[SENSORS] 노드 ID 설정 실패: {}".format(ex))
 
+    # CdS 광전소자 캘리브레이션 로드 (lux/percent/resistance 변환용)
+    try:
+        cds_calib = getattr(node_config, "CDS_CALIB", {})
+        if cds_calib:
+            sensor_runner.sm._cds_calib = cds_calib
+            print("[SENSORS] CdS 캘리브레이션 로드: {} 개".format(len(cds_calib)))
+    except Exception as ex:
+        print("[SENSORS] CdS 캘리브 로드 실패: {}".format(ex))
+
+    # 홀 센서 캘리브레이션 로드 (아날로그 자기장 변환 / 디지털 감지설정)
+    try:
+        hall_calib = getattr(node_config, "HALL_CALIB", {})
+        if hall_calib:
+            sensor_runner.sm._hall_calib = hall_calib
+            print("[SENSORS] Hall 캘리브레이션 로드: {} 개".format(len(hall_calib)))
+    except Exception as ex:
+        print("[SENSORS] Hall 캘리브 로드 실패: {}".format(ex))
+
     if not hasattr(node_config, "SENSOR_CONFIG") or not node_config.SENSOR_CONFIG:
         print("[SENSORS] SENSOR_CONFIG 없음 또는 빈 값")
         return
