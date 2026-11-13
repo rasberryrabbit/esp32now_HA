@@ -32,6 +32,28 @@ SENSOR_CONFIG = {
     # "CO2": ("sgp30", 0x58, "co2"),
     # "TVOC": ("sgp30", 0x58, "tvoc"),
 
+    # MPU6050 (6축 가속도/자이로, I2C 기본주소 0x68)
+    # channel 종류:
+    #   ax/ay/az  - 가속도 (g, ±2g 범위)
+    #   gx/gy/gz  - 자이로 각속도 (dps, ±250 dps 범위)
+    #   temp      - 칩 온도 (C)
+    #   roll      - 가속도 기반 roll 각 (deg)
+    #   pitch     - 가속도 기반 pitch 각 (deg)
+    #   amag      - 가속도 크기 (g, 정지 시 ~1.0)
+    #   gyaw      - 자이로 적분 yaw 상대각 (deg, drift 발생)
+    # yaw 리셋: sensor_runner.sm.reset_mpu_yaw(0x68)
+    # "가속도X": ("mpu6050", 0x68, "ax"),
+    # "가속도Y": ("mpu6050", 0x68, "ay"),
+    # "가속도Z": ("mpu6050", 0x68, "az"),
+    # "자이로X": ("mpu6050", 0x68, "gx"),
+    # "자이로Y": ("mpu6050", 0x68, "gy"),
+    # "자이로Z": ("mpu6050", 0x68, "gz"),
+    # "기울기Roll": ("mpu6050", 0x68, "roll"),
+    # "기울기Pitch": ("mpu6050", 0x68, "pitch"),
+    # "가속도크기": ("mpu6050", 0x68, "amag"),
+    # "방위각": ("mpu6050", 0x68, "gyaw"),
+    # "MPU온도": ("mpu6050", 0x68, "temp"),
+
     # ESP32 내장 ADC
     "배터리": ("adc", 1, "voltage"),
 

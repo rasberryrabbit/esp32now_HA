@@ -71,7 +71,7 @@
 
 ### 센서/GPIO 제어
 
-- 센서 자동 감지 (DHT22, BH1750, ADC, 가변저항 등)
+- 센서 자동 감지 (DHT22, BH1750, BME280, SHT30, DS18B20, SGP30, MPU6050, ADS1115, MCP3008, MAX6675, ADC, I2C 확장 입력)
 - GPIO 이름 기반 원격 제어: `/GPIO <이름> <값>`
 - PWM 듀티 제어 (0-1023 또는 0-100%)
 - 장치 정보 브로드캐스트 (device_info 메시지)
@@ -181,6 +181,43 @@ PWM_CONFIG = {
     "거실팬": 5,
 }
 ```
+
+### MPU6050 (6축 가속도/자이로) 설정
+
+MPU6050은 I2C로 연결하며 기본 주소는 `0x68`(AD0=GND) 또는 `0x69`(AD0=VDD)입니다. 한 칩에서 여러 파생값을 센서로 등록할 수 있습니다. 같은 주소의 채널들은 한 번의 I2C 읽기 결과를 500ms 동안 공유하므로 버스 부하가 없습니다.
+
+**지원 채널:**
+
+| channel | 단위 | 설명 |
+|---------|------|------|
+| `ax` `ay` `az` | g | 가속도 (±2g, 1g=16384 LSB) |
+| `gx` `gy` `gz` | dps | 자이로 각속도 (±250 dps, 1 dps=131 LSB) |
+| `temp` | C | 칩 내부 온도 |
+| `roll` | deg | 가속도 기반 roll 각도 (`atan2(ay, az)`) |
+| `pitch` | deg | 가속도 기반 pitch 각도 (`atan2(-ax, √(ay²+az²))`) |
+| `amag` | g | 가속도 크기 (정지 시 ≈1.0, 충격 시 급증) |
+| `gyaw` | deg | 자이로 Z축 적분 상대 방위각 (drift 발생) |
+
+```python
+# custom/node_config.py
+SENSOR_CONFIG = {
+    "기울기Roll":  ("mpu6050", 0x68, "roll"),
+    "기울기Pitch": ("mpu6050", 0x68, "pitch"),
+    "가속도크기":  ("mpu6050", 0x68, "amag"),   # 충격/낙하 감지
+    "방위각":      ("mpu6050", 0x68, "gyaw"),   # 회전 각도 (상대)
+    "MPU온도":     ("mpu6050", 0x68, "temp"),
+}
+```
+
+**yaw 재보정:** 자이로 적분값은 시간이 지나면 drift가 누적됩니다. 기준 방향으로 맞출 때 아래 호출로 0부터 다시 적분합니다.
+
+```python
+import sensor_runner
+sensor_runner.sm.reset_mpu_yaw(0x68)        # 특정 칩만
+sensor_runner.sm.reset_mpu_yaw()            # 등록된 모든 MPU6050
+```
+
+**주의:** `gyaw`는 자이로만 적분한 상대각이므로 절대 방위가 아닙니다. 절대 방위가 필요하면 MPU9250(자력계 포함) 등을 사용해야 합니다. `roll`/`pitch`는 중력 방향을 기준으로 하므로 정지 또는 완만한 동작에서 정확합니다.
 
 ## 자동화 규칙 예제
 

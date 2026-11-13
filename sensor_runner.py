@@ -64,6 +64,13 @@ try:
 except ImportError:
     _HAS_NEOPIXEL = False
 
+# math (roll/pitch/amag 계산용)
+try:
+    import math
+    _HAS_MATH = True
+except ImportError:
+    _HAS_MATH = False
+
 # ADS1115 (외부 라이브러리 사용 시, 없으면 직접 I2C 제어)
 try:
     import ads1115 as _ads1115
@@ -169,6 +176,7 @@ class SensorManager:
         self.onewire_buses = {}
         self.onewire_roms = {}
         self._neopixel_counts = {}
+        self._mpu_yaw_state = {}   # {i2c_addr: {"yaw": float, "ts": ms}} - 자이로 yaw 적분
         self.node_id = "unknown"
         self.nickname = "unknown"
 
@@ -286,7 +294,9 @@ class SensorManager:
             ("sgp30", "co2"): "ppm", ("sgp30", "tvoc"): "ppb",
             ("mpu6050", "ax"): "g", ("mpu6050", "ay"): "g", ("mpu6050", "az"): "g",
             ("mpu6050", "gx"): "dps", ("mpu6050", "gy"): "dps", ("mpu6050", "gz"): "dps",
-            ("mpu6050", "temp"): "C", ("neopixel", "count"): "",
+            ("mpu6050", "temp"): "C",
+            ("mpu6050", "roll"): "deg", ("mpu6050", "pitch"): "deg",
+            ("mpu6050", "amag"): "g", ("mpu6050", "gyaw"): "deg", ("neopixel", "count"): "",
             ("i2c_input", "state"): "",
             ("ads1115", "raw"): "", ("ads1115", "voltage"): "V",
         }
@@ -384,15 +394,22 @@ class SensorManager:
                     if not self.init_i2c():
                         return None
                 try:
+                    # PWR_MGMT_1=0: 절전 해제, 내부 8MHz 클럭 사용
                     self.i2c_bus.writeto(pin_or_addr, bytes([0x6B, 0]))
                     time.sleep_ms(100)
+                    # ACCEL_CONFIG=0: ±2g (1g = 16384 LSB)
                     self.i2c_bus.writeto(pin_or_addr, bytes([0x1C, 0x00]))
+                    # GYRO_CONFIG=0: ±250 dps (1 dps = 131 LSB)
                     self.i2c_bus.writeto(pin_or_addr, bytes([0x1B, 0x00]))
+                    # CONFIG=3: DLPF 설정 3 (대역폭 ~44Hz, 노이즈 감소)
+                    self.i2c_bus.writeto(pin_or_addr, bytes([0x1A, 0x03]))
+                    # SMPLRT_DIV=0: 샘플링 1kHz
+                    self.i2c_bus.writeto(pin_or_addr, bytes([0x19, 0x00]))
                 except Exception as ex:
                     print("[SENSOR] MPU6050 초기화 오류:", ex)
                     return None
                 self._objects[key] = self.i2c_bus
-                print("[SENSOR] MPU6050 초기화 (0x{:02x})".format(pin_or_addr))
+                print("[SENSOR] MPU6050 초기화 (0x{:02x}, ±2g/±250dps, DLPF=3)".format(pin_or_addr))
                 return self.i2c_bus
             elif stype == "neopixel":
                 if not _HAS_NEOPIXEL:
@@ -520,19 +537,64 @@ class SensorManager:
                 elif channel == "tvoc":
                     return tvoc
             elif stype == "mpu6050":
-                sensor.writeto(pin_or_addr, bytes([0x3B]))
-                data = sensor.readfrom(pin_or_addr, 14)
-                def s16(d, i):
-                    v = (d[i] << 8) | d[i + 1]
-                    return v - 65536 if v >= 32768 else v
-                ax, ay, az = s16(data, 0), s16(data, 2), s16(data, 4)
-                t_raw = s16(data, 6)
-                gx, gy, gz = s16(data, 8), s16(data, 10), s16(data, 12)
-                m = {"ax": ax / 16384, "ay": ay / 16384, "az": az / 16384,
-                     "gx": gx / 131, "gy": gy / 131, "gz": gz / 131,
-                     "temp": t_raw / 340 + 36.53}
+                # 같은 디바이스의 여러 채널(ax/ay/.../gyaw)이 한 번의 I2C 읽기 공유
+                # 500ms 이내 캐시 재사용 → I2C 버스 부하 감소 + 채널 간 일관성
+                cache_key = ("mpu6050_data", pin_or_addr)
+                now_ms = time.ticks_ms()
+                cache = self._objects.get(cache_key)
+                if cache is not None and abs(time.ticks_diff(now_ms, cache["ts"])) < 500:
+                    m = cache["m"]
+                else:
+                    sensor.writeto(pin_or_addr, bytes([0x3B]))
+                    data = sensor.readfrom(pin_or_addr, 14)
+                    def s16(d, i):
+                        v = (d[i] << 8) | d[i + 1]
+                        return v - 65536 if v >= 32768 else v
+                    ax_r, ay_r, az_r = s16(data, 0), s16(data, 2), s16(data, 4)
+                    t_raw = s16(data, 6)
+                    gx_r, gy_r, gz_r = s16(data, 8), s16(data, 10), s16(data, 12)
+                    ax_g = ax_r / 16384
+                    ay_g = ay_r / 16384
+                    az_g = az_r / 16384
+                    gx_d = gx_r / 131
+                    gy_d = gy_r / 131
+                    gz_d = gz_r / 131
+                    # 가속도 기반 기울기 (roll/pitch) + 가속도 크기 (amag)
+                    roll = 0.0
+                    pitch = 0.0
+                    amag = 0.0
+                    if _HAS_MATH:
+                        roll = math.degrees(math.atan2(ay_g, az_g))
+                        pitch = math.degrees(math.atan2(-ax_g, math.sqrt(ay_g * ay_g + az_g * az_g)))
+                        amag = math.sqrt(ax_g * ax_g + ay_g * ay_g + az_g * az_g)
+                    # 자이로 적분 yaw (상대 방위각, drift 발생 - 절대각 아님)
+                    yaw_state = self._mpu_yaw_state.get(pin_or_addr)
+                    if yaw_state is None:
+                        dt = 0.0
+                        new_yaw = 0.0
+                    else:
+                        dt = time.ticks_diff(now_ms, yaw_state["ts"]) / 1000.0
+                        if dt < 0 or dt > 10:
+                            dt = 0.0
+                        new_yaw = yaw_state["yaw"] + gz_d * dt
+                    self._mpu_yaw_state[pin_or_addr] = {"yaw": new_yaw, "ts": now_ms}
+                    m = {"ax": ax_g, "ay": ay_g, "az": az_g,
+                         "gx": gx_d, "gy": gy_d, "gz": gz_d,
+                         "temp": t_raw / 340 + 36.53,
+                         "roll": roll, "pitch": pitch, "amag": amag,
+                         "gyaw": new_yaw}
+                    self._objects[cache_key] = {"ts": now_ms, "m": m}
                 if channel in m:
-                    return round(m[channel], 3 if channel.startswith("a") else 2 if channel.startswith("g") else 1)
+                    v = m[channel]
+                    if channel in ("ax", "ay", "az", "amag"):
+                        return round(v, 3)
+                    if channel in ("gx", "gy", "gz"):
+                        return round(v, 2)
+                    if channel in ("roll", "pitch", "gyaw"):
+                        return round(v, 1)
+                    if channel == "temp":
+                        return round(v, 1)
+                    return round(v, 2)
             elif stype == "neopixel":
                 if channel == "count":
                     return self._neopixel_counts.get(pin_or_addr, 0)
@@ -553,6 +615,21 @@ class SensorManager:
             if value is not None:
                 result[name] = value
         return result
+
+    def reset_mpu_yaw(self, i2c_addr=None):
+        """MPU6050 자이로 yaw 적분값을 0으로 재설정 (재보정용).
+
+        인자:
+          i2c_addr: 특정 주소만 리셋. None이면 등록된 모든 MPU6050 리셋.
+        """
+        if i2c_addr is not None:
+            if i2c_addr in self._mpu_yaw_state:
+                self._mpu_yaw_state[i2c_addr]["yaw"] = 0.0
+                print("[SENSOR] MPU6050 0x{:02x} yaw 리셋".format(i2c_addr))
+        else:
+            for addr in self._mpu_yaw_state:
+                self._mpu_yaw_state[addr]["yaw"] = 0.0
+            print("[SENSOR] 모든 MPU6050 yaw 리셋 ({}개)".format(len(self._mpu_yaw_state)))
 
     # ============ 장치 정보 ============
     def get_device_list(self):

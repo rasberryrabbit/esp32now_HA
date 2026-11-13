@@ -81,7 +81,7 @@ Files that users modify per node. Auto-imported at boot and setup() is called.
 - MAX6675 (thermocouple, SPI)
 - MCP3008 (ADC, SPI)
 - SGP30 (CO2/TVOC, I2C)
-- MPU6050 (accelerometer/gyroscope, I2C)
+- MPU6050 (accelerometer/gyroscope, I2C) — raw accel/gyro, roll/pitch, accel magnitude, gyro-integrated yaw
 - ADS1115 (4-channel 16-bit I2C ADC)
 - ESP32 internal ADC
 - I2C GPIO expander inputs (MCP23017/PCF8574 as digital sensor)
@@ -244,6 +244,43 @@ I2C_FREQ = 400000
 SENSOR_READ_INTERVAL = 3   # Read every 3 seconds
 SENSOR_SEND_INTERVAL = 5   # Send every 5 seconds
 ```
+
+### MPU6050 (6-axis accelerometer/gyroscope)
+
+MPU6050 connects via I2C at default address `0x68` (AD0=GND) or `0x69` (AD0=VDD). Multiple derived channels can be registered from a single chip. Channels sharing the same address reuse one I2C read for 500 ms, so there is no extra bus load.
+
+**Supported channels:**
+
+| channel | unit | description |
+|---------|------|-------------|
+| `ax` `ay` `az` | g | acceleration (±2g, 1g=16384 LSB) |
+| `gx` `gy` `gz` | dps | gyro angular rate (±250 dps, 1 dps=131 LSB) |
+| `temp` | C | chip internal temperature |
+| `roll` | deg | accelerometer-based roll (`atan2(ay, az)`) |
+| `pitch` | deg | accelerometer-based pitch (`atan2(-ax, √(ay²+az²))`) |
+| `amag` | g | acceleration magnitude (≈1.0 at rest, spikes on shock) |
+| `gyaw` | deg | gyro-Z integrated relative heading (drifts over time) |
+
+```python
+# custom/node_config.py
+SENSOR_CONFIG = {
+    "tilt_roll":  ("mpu6050", 0x68, "roll"),
+    "tilt_pitch": ("mpu6050", 0x68, "pitch"),
+    "accel_mag":  ("mpu6050", 0x68, "amag"),   # shock/fall detection
+    "heading":    ("mpu6050", 0x68, "gyaw"),   # relative rotation
+    "mpu_temp":   ("mpu6050", 0x68, "temp"),
+}
+```
+
+**Yaw recalibration:** the gyro-integrated value drifts over time. Reset to zero at a known orientation with:
+
+```python
+import sensor_runner
+sensor_runner.sm.reset_mpu_yaw(0x68)   # specific chip only
+sensor_runner.sm.reset_mpu_yaw()       # all registered MPU6050s
+```
+
+**Note:** `gyaw` is a gyro-only relative angle, not an absolute heading. For absolute heading use a magnetometer-equipped chip (e.g. MPU9250). `roll`/`pitch` are gravity-referenced and accurate at rest or during slow motion.
 
 ## Automation Rules
 
